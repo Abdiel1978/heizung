@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<!--
+  Heizungsanzeige v1.0
+  - liest per MQTT over WebSocket (wss, Port 8084) von EMQX Serverless:
+      heizung/temps (retained, live jede Minute)
+      heizung/history (retained, 24 h im 5-min-Raster, base64 int16)
+      heizung/online  (retained "1"/"0")
+  - Einstellungen (Zugang, Kanalnamen, Farben, Sichtbarkeit) im Browser gespeichert,
+    per Link (#cfg=...) übertragbar
+  - passt zu CAN Logger ESP v2.7
+-->
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Heizung">
+<meta name="theme-color" content="#111111">
+<title>Heizung</title>
+<script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,system-ui,sans-serif;background:#111;color:#eee;
+       font-size:20px;padding:env(safe-area-inset-top) 8px 8px 8px}
+  header{display:flex;align-items:center;gap:8px;padding:8px 2px}
+  #dot{width:16px;height:16px;border-radius:50%;background:#555;flex-shrink:0}
+  #dot.ok{background:#4c4}#dot.warn{background:#fa3}#dot.err{background:#e33}
+  #stat{flex:1;font-size:.8em;color:#bbb;line-height:1.2}
+  #gear{background:#222;border:1px solid #444;color:#ddd;font-size:1.2em;
+        border-radius:8px;padding:2px 10px}
+  #tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:6px}
+  .tile{background:#1c1c1c;border-radius:8px;padding:6px 8px;border-left:6px solid #555;
+        opacity:.75}
+  .tile.sel{opacity:1;background:#262626;outline:2px solid #666}
+  .tile .nm{font-size:.8em;color:#aaa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tile .val{font-size:1.9em;font-weight:700;line-height:1.1}
+  .tile .val small{font-size:.5em;font-weight:400;color:#aaa;margin-left:4px}
+  .tile .mm{font-size:.65em;color:#888}
+  #ranges{display:flex;gap:6px;margin:10px 0 4px}
+  #ranges button{flex:1;background:#222;border:1px solid #444;color:#bbb;
+                 font-size:.85em;padding:6px 0;border-radius:6px}
+  #ranges button.on{color:#fff;border-color:#4fc3f7;background:#1a2a33}
+  #chartBox{position:relative;height:46vh;min-height:260px}
+  #hint{font-size:.65em;color:#777;margin-top:4px}
+  #setup{display:none;position:fixed;inset:0;background:#111;overflow-y:auto;
+         padding:calc(env(safe-area-inset-top) + 8px) 10px 30px;z-index:10}
+  #setup h2{font-size:1em;color:#aaa;margin:12px 0 6px}
+  .row{display:flex;align-items:center;gap:6px;margin:5px 0}
+  .row label{min-width:5.5em;font-size:.85em;color:#aaa}
+  .row input[type=text],.row input[type=password],.row input[type=number]{
+        flex:1;min-width:0;background:#1c1c1c;border:1px solid #444;color:#fff;
+        font-size:.9em;padding:7px;border-radius:6px}
+  .row input[type=checkbox]{width:26px;height:26px}
+  .row input[type=color]{width:42px;height:34px;border:none;background:none;padding:0}
+  .row .no{font-size:.75em;color:#777;width:1.6em;text-align:right}
+  .btns{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+  .btns button{flex:1;min-width:40%;font-size:.95em;padding:11px;border-radius:8px;
+               border:1px solid #444;background:#222;color:#eee}
+  .btns button.pri{background:#2a6;border-color:#2a6;color:#fff}
+  #msg{font-size:.8em;color:#8c8;margin-top:8px;min-height:1.2em}
+</style>
+</head>
+<body>
+
+<header>
+  <div id="dot"></div>
+  <div id="stat">Starte…</div>
+  <button id="gear" onclick="openSetup()">⚙</button>
+</header>
+
+<div id="tiles"></div>
+
+<div id="ranges">
+  <button data-h="3">3 h</button>
+  <button data-h="12">12 h</button>
+  <button data-h="24">24 h</button>
+</div>
+<div id="chartBox"><canvas id="chart"></canvas></div>
+<div id="hint">Kachel antippen = Kurve ein/aus · v1.0</div>
+
+<!-- Einstellungen -->
+<div id="setup">
+  <h2>Zugang</h2>
+  <div class="row"><label>Server</label><input type="text" id="sHost" autocapitalize="off" autocorrect="off"></div>
+  <div class="row"><label>Port</label><input type="number" id="sPort"></div>
+  <div class="row"><label>Benutzer</label><input type="text" id="sUser" autocapitalize="off" autocorrect="off"></div>
+  <div class="row"><label>Passwort</label><input type="password" id="sPass"></div>
+  <h2>Kanäle</h2>
+  <div class="row"><input type="checkbox" id="sHideEmpty"><label style="min-width:0">Kanäle ohne Werte ausblenden</label></div>
+  <div id="sCh"></div>
+  <div class="btns">
+    <button class="pri" onclick="saveSetup()">Speichern</button>
+    <button onclick="closeSetup()">Abbrechen</button>
+    <button onclick="shareLink()">Link mit Einstellungen kopieren</button>
+  </div>
+  <div id="msg"></div>
+</div>
+
+<script>
+const VERSION = '1.0';
+const NCH = 15;
+const PALETTE = ['#4fc3f7','#ff8a65','#aed581','#ffd54f','#ba68c8','#4db6ac','#f06292',
+                 '#90a4ae','#e57373','#81c784','#64b5f6','#ffb74d','#a1887f','#dce775','#9575cd'];
+const DEF = {
+  host: 'l61ff911.ala.eu-central-1.emqxsl.com', port: 8084,
+  user: 'heizung-anzeige', pass: '',
+  hideEmpty: true, range: 24, sel: [0, 1, 2],
+  ch: Array.from({length: NCH}, (_, i) => ({
+    name: 'Kanal ' + String(i + 1).padStart(2, '0'), show: true, color: PALETTE[i]}))
+};
+
+// ---------- Einstellungen ----------
+function b64enc(s){ return btoa(unescape(encodeURIComponent(s))); }
+function b64dec(s){ return decodeURIComponent(escape(atob(s))); }
+
+function mergeCfg(o){
+  const c = JSON.parse(JSON.stringify(DEF));
+  if (!o) return c;
+  for (const k of ['host','port','user','pass','hideEmpty','range','sel'])
+    if (o[k] !== undefined) c[k] = o[k];
+  if (Array.isArray(o.ch)) o.ch.forEach((x, i) => { if (i < NCH) Object.assign(c.ch[i], x); });
+  return c;
+}
+function loadCfg(){
+  let stored = null;
+  try { stored = JSON.parse(localStorage.getItem('heizungCfg') || 'null'); } catch(e){}
+  if (location.hash.startsWith('#cfg=')) {
+    try {
+      stored = JSON.parse(b64dec(location.hash.slice(5)));
+      localStorage.setItem('heizungCfg', JSON.stringify(stored));
+    } catch(e){ alert('Einstellungs-Link ungültig'); }
+    history.replaceState(null, '', location.pathname);
+  }
+  return mergeCfg(stored);
+}
+function storeCfg(){ try { localStorage.setItem('heizungCfg', JSON.stringify(cfg)); } catch(e){} }
+let cfg = loadCfg();
+
+// ---------- Daten ----------
+let histPts = [];       // {t, v[15]} aus heizung/history (Slot-Mitte)
+let histEndT = 0;       // Ende des letzten History-Slots (ms)
+let live = [];          // {t, v[15]} aus heizung/temps
+let lastTs = 0;
+let online = null;
+let connOk = false;
+let lastErr = '';
+
+function allPts(){
+  return histPts.concat(live.filter(p => p.t > histEndT));
+}
+
+function onHistory(s){
+  const j = JSON.parse(s);
+  const bin = atob(j.d);
+  const dv = new DataView(new ArrayBuffer(bin.length));
+  for (let i = 0; i < bin.length; i++) dv.setUint8(i, bin.charCodeAt(i));
+  const pts = [];
+  for (let k = 0; k < j.n; k++) {
+    const v = [];
+    for (let c = 0; c < j.ch; c++) {
+      const x = dv.getInt16((k * j.ch + c) * 2, true);
+      v.push(x === -32768 ? null : x / 10);
+    }
+    pts.push({t: (j.first + k * j.step + j.step / 2) * 1000, v});
+  }
+  histPts = pts;
+  histEndT = (j.first + j.n * j.step) * 1000;
+  render();
+}
+
+function onTemps(s){
+  const j = JSON.parse(s);
+  if (!j.ts) return;
+  const t = j.ts * 1000;
+  if (live.length && live[live.length - 1].t === t) return;
+  live.push({t, v: j.t.map(x => (x === null || x === undefined) ? null : +x)});
+  const cut = Date.now() - 26 * 3600e3;
+  live = live.filter(p => p.t > cut);
+  lastTs = Math.max(lastTs, t);
+  render();
+  updStatus();
+}
+
+// ---------- MQTT ----------
+let client = null;
+function connect(){
+  if (client) { try { client.end(true); } catch(e){} client = null; }
+  connOk = false;
+  if (!cfg.pass) { updStatus(); return; }
+  client = mqtt.connect(`wss://${cfg.host}:${cfg.port}/mqtt`, {
+    username: cfg.user, password: cfg.pass,
+    clientId: 'anzeige-' + Math.random().toString(16).slice(2, 10),
+    clean: true, reconnectPeriod: 5000, connectTimeout: 15000
+  });
+  client.on('connect', () => {
+    connOk = true; lastErr = '';
+    client.subscribe(['heizung/temps', 'heizung/history', 'heizung/online']);
+    updStatus();
+  });
+  client.on('close', () => { connOk = false; updStatus(); });
+  client.on('error', e => { lastErr = e.message || String(e); updStatus(); });
+  client.on('message', (topic, payload) => {
+    const s = payload.toString();
+    try {
+      if (topic === 'heizung/history') onHistory(s);
+      else if (topic === 'heizung/temps') onTemps(s);
+      else if (topic === 'heizung/online') { online = (s === '1'); updStatus(); }
+    } catch(e){ console.log(topic, e); }
+  });
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && client && !client.connected) client.reconnect();
+  updStatus();
+});
+
+// ---------- Anzeige ----------
+function fmtAge(ms){
+  const s = Math.round(ms / 1000);
+  if (s < 90) return s + ' s';
+  if (s < 5400) return Math.round(s / 60) + ' min';
+  return (s / 3600).toFixed(1) + ' h';
+}
+function updStatus(){
+  const dot = document.getElementById('dot'), st = document.getElementById('stat');
+  let cls = 'err', txt;
+  if (!cfg.pass) txt = 'Bitte Zugang in ⚙ eintragen';
+  else if (!connOk) txt = 'Keine Verbindung zum Server' + (lastErr ? ' (' + lastErr + ')' : '');
+  else if (online === false) txt = 'Messgerät offline' + (lastTs ? ' · letzter Wert vor ' + fmtAge(Date.now() - lastTs) : '');
+  else if (!lastTs) { cls = 'warn'; txt = 'Verbunden, warte auf Werte…'; }
+  else {
+    const age = Date.now() - lastTs;
+    cls = age < 180e3 ? 'ok' : 'warn';
+    txt = (age < 180e3 ? 'Aktuell' : 'Keine neuen Werte') + ' · vor ' + fmtAge(age);
+  }
+  dot.className = cls;
+  st.textContent = txt;
+}
+
+function chHasData(c, pts){ return pts.some(p => p.v[c] !== null); }
+
+function renderTiles(pts){
+  const box = document.getElementById('tiles');
+  const now = Date.now(), from = now - 24 * 3600e3;
+  let h = '';
+  for (let c = 0; c < NCH; c++) {
+    const ch = cfg.ch[c];
+    if (!ch.show) continue;
+    if (cfg.hideEmpty && pts.length && !chHasData(c, pts)) continue;
+    let cur = null, curT = 0, mn = Infinity, mx = -Infinity, old = null;
+    for (const p of pts) {
+      const v = p.v[c];
+      if (v === null) continue;
+      if (p.t >= curT) { cur = v; curT = p.t; }
+      if (p.t >= from) { mn = Math.min(mn, v); mx = Math.max(mx, v); }
+    }
+    // Trend: Vergleich mit Wert vor ~30 min
+    for (const p of pts) if (p.v[c] !== null && p.t <= curT - 30 * 60e3) old = p.v[c];
+    let tr = '';
+    if (cur !== null && old !== null) tr = cur - old > 0.5 ? '↑' : (old - cur > 0.5 ? '↓' : '→');
+    const sel = cfg.sel.includes(c);
+    h += `<div class="tile${sel ? ' sel' : ''}" style="border-left-color:${ch.color}" onclick="toggleSel(${c})">
+      <div class="nm">${esc(ch.name)}</div>
+      <div class="val">${cur === null ? '–' : cur.toFixed(1) + '°'}<small>${tr}</small></div>
+      <div class="mm">${mn === Infinity ? '&nbsp;' : '24 h: ' + mn.toFixed(0) + '…' + mx.toFixed(0) + '°'}</div>
+    </div>`;
+  }
+  box.innerHTML = h || '<div style="color:#777">Noch keine Daten</div>';
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m])); }
+
+let chart = null;
+function renderChart(pts){
+  const now = Date.now(), from = now - cfg.range * 3600e3;
+  const sub = pts.filter(p => p.t >= from);
+  const ds = cfg.sel.filter(c => cfg.ch[c] && cfg.ch[c].show).map(c => ({
+    label: cfg.ch[c].name,
+    data: sub.map(p => ({x: p.t, y: p.v[c]})),
+    borderColor: cfg.ch[c].color, backgroundColor: cfg.ch[c].color,
+    borderWidth: 2.5, pointRadius: 0, tension: 0.2, spanGaps: 12 * 60e3
+  }));
+  if (!chart) {
+    chart = new Chart(document.getElementById('chart'), {
+      type: 'line',
+      data: {datasets: ds},
+      options: {
+        animation: false, maintainAspectRatio: false, parsing: false,
+        interaction: {mode: 'nearest', axis: 'x', intersect: false},
+        plugins: {
+          legend: {labels: {color: '#ccc', boxWidth: 14, font: {size: 14}}},
+          tooltip: {callbacks: {
+            title: it => new Date(it[0].parsed.x).toLocaleString('de-DE',
+                     {weekday:'short', hour:'2-digit', minute:'2-digit'}),
+            label: it => ' ' + it.dataset.label + ': ' + it.parsed.y.toFixed(1) + ' °C'}}
+        },
+        scales: {
+          x: {type: 'linear', min: from, max: now,
+              ticks: {color: '#999', font: {size: 13}, maxTicksLimit: 7,
+                      callback: v => new Date(v).toLocaleTimeString('de-DE', {hour:'2-digit', minute:'2-digit'})},
+              grid: {color: '#2a2a2a'}},
+          y: {ticks: {color: '#999', font: {size: 13}, callback: v => v + '°'},
+              grid: {color: '#2a2a2a'}}
+        }
+      }
+    });
+  } else {
+    chart.data.datasets = ds;
+    chart.options.scales.x.min = from;
+    chart.options.scales.x.max = now;
+    chart.update('none');
+  }
+}
+
+function render(){
+  const pts = allPts();
+  renderTiles(pts);
+  renderChart(pts);
+  document.querySelectorAll('#ranges button').forEach(b =>
+    b.classList.toggle('on', +b.dataset.h === cfg.range));
+}
+
+function toggleSel(c){
+  const i = cfg.sel.indexOf(c);
+  if (i >= 0) cfg.sel.splice(i, 1); else cfg.sel.push(c);
+  storeCfg(); render();
+}
+document.querySelectorAll('#ranges button').forEach(b => b.onclick = () => {
+  cfg.range = +b.dataset.h; storeCfg(); render();
+});
+
+// ---------- Einstellungen UI ----------
+function openSetup(){
+  document.getElementById('sHost').value = cfg.host;
+  document.getElementById('sPort').value = cfg.port;
+  document.getElementById('sUser').value = cfg.user;
+  document.getElementById('sPass').value = cfg.pass;
+  document.getElementById('sHideEmpty').checked = cfg.hideEmpty;
+  let h = '';
+  cfg.ch.forEach((ch, i) => {
+    h += `<div class="row"><span class="no">${i + 1}</span>
+      <input type="checkbox" id="cS${i}" ${ch.show ? 'checked' : ''}>
+      <input type="text" id="cN${i}" value="${esc(ch.name)}">
+      <input type="color" id="cC${i}" value="${ch.color}"></div>`;
+  });
+  document.getElementById('sCh').innerHTML = h;
+  document.getElementById('msg').textContent = '';
+  document.getElementById('setup').style.display = 'block';
+}
+function readSetup(){
+  const c = JSON.parse(JSON.stringify(cfg));
+  c.host = document.getElementById('sHost').value.trim();
+  c.port = +document.getElementById('sPort').value || 8084;
+  c.user = document.getElementById('sUser').value.trim();
+  c.pass = document.getElementById('sPass').value;
+  c.hideEmpty = document.getElementById('sHideEmpty').checked;
+  c.ch.forEach((ch, i) => {
+    ch.show  = document.getElementById('cS' + i).checked;
+    ch.name  = document.getElementById('cN' + i).value.trim() || ('Kanal ' + (i + 1));
+    ch.color = document.getElementById('cC' + i).value;
+  });
+  return c;
+}
+function closeSetup(){ document.getElementById('setup').style.display = 'none'; }
+function saveSetup(){
+  const old = cfg;
+  cfg = readSetup();
+  storeCfg();
+  closeSetup();
+  if (old.host !== cfg.host || old.port !== cfg.port || old.user !== cfg.user || old.pass !== cfg.pass)
+    connect();
+  render(); updStatus();
+}
+function shareLink(){
+  const c = readSetup();
+  const url = location.origin + location.pathname + '#cfg=' + b64enc(JSON.stringify(c));
+  const m = document.getElementById('msg');
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url)
+      .then(() => m.textContent = 'Link kopiert – enthält auch das Passwort.')
+      .catch(() => prompt('Link kopieren:', url));
+  } else prompt('Link kopieren:', url);
+}
+
+// ---------- Start ----------
+render();
+updStatus();
+connect();
+setInterval(() => { updStatus(); if (chart) render(); }, 30000);
+</script>
+</body>
+</html>
